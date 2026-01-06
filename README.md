@@ -149,7 +149,8 @@ Livros Recomendados:
 
 ---
 
-Desenvolvido por: [Seu Nome/Organização, se desejar]
-Data: [Data da criação/última atualização]
-`
+Desenvolvido por: Maciel
+Data: Data da criação:06/01/2026
+Última atualização:06/01/2026
+
 
