@@ -1,522 +1,1052 @@
 import streamlit as st
 import numpy as np
-from scipy.integrate import trapezoid
-import pandas as pd
+import scipy.linalg as la
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import norm, uniform
-from scipy.optimize import minimize
-
-# --- Streamlit Page Configuration ---
-st.set_page_config(
-    page_title="Inferência Bayesiana para Compósitos",
-    page_icon="🔬",
-    layout="wide"
-)
-
-st.title("🔬 Inferência Bayesiana para Caracterização de Laminados Compósitos via Ultrassom")
-st.markdown("Esta aplicação interativa demonstra os conceitos e etapas da inferência Bayesiana aplicada à caracterização de propriedades elásticas de compósitos usando ultrassom.")
-
-# --- Helper Functions (Simulations) ---
-
-# Módulo 1: Simplified Christoffel Solver (Conceptual)
-def simulate_christoffel_velocities(C_vals, rho, angle_deg):
+import pandas as pd
+from scipy.stats import norm, uniform, multivariate_normal
+import time
+import multiprocessing as mp
+from functools import partial
+# --- 0. Configurações e Constantes Globais ---
+st.set_page_config(layout="wide", page_title="Inferência Bayesiana para Compósitos via Ultrassom")
+# Cores para gráficos
+COLORS = sns.color_palette("viridis", 5)
+# Propriedades padrão para Carbono-Epóxi Unidirecional (aproximadas, em GPa)
+# C_ij em notação de Voigt (6x6)
+# C11, C22, C33, C12, C13, C23, C44, C55, C66
+DEFAULT_C_ORTHOTROPIC_GPA = np.array([
+    [140.0, 5.0, 5.0, 0.0, 0.0, 0.0],
+    [5.0, 10.0, 5.0, 0.0, 0.0, 0.0],
+    [5.0, 5.0, 10.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 3.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 6.0, 0.0],
+    [0.0, 0.0, 0.0, 0.0, 0.0, 6.0]
+])
+# Ajustar para simetria C_ij = C_ji
+DEFAULT_C_ORTHOTROPIC_GPA[0,1] = DEFAULT_C_ORTHOTROPIC_GPA[1,0] = 5.0
+DEFAULT_C_ORTHOTROPIC_GPA[0,2] = DEFAULT_C_ORTHOTROPIC_GPA[2,0] = 5.0
+DEFAULT_C_ORTHOTROPIC_GPA[1,2] = DEFAULT_C_ORTHOTROPIC_GPA[2,1] = 5.0
+# Apenas os 9 independentes para ortotrópico
+DEFAULT_C_PARAMS_GPA = {
+    'C11': 140.0, 'C22': 10.0, 'C33': 10.0,
+    'C12': 5.0, 'C13': 5.0, 'C23': 5.0,
+    'C44': 3.0, 'C55': 6.0, 'C66': 6.0
+}
+DEFAULT_RHO_KG_M3 = 1550.0 # kg/m^3
+# Parâmetros para MCMC
+MCMC_DEFAULTS = {
+    'n_iter': 10000,
+    'burn_in': 2000,
+    'n_chains': 2,
+    'proposal_scale': 0.05 # Escala inicial para a covariância da proposta
+}
+# --- Funções Auxiliares ---
+def voigt_to_full_tensor(C_voigt_gpa):
     """
-    Simula velocidades de onda para um material ortotrópico simplificado.
-    Não é um solver Christoffel completo, mas ilustra a dependência angular.
-    Assume propagação no plano 1-2.
+    Converte a matriz de rigidez de Voigt (6x6) para o tensor completo (3x3x3x3).
+    Assume C_voigt_gpa está em GPa. Retorna em Pa.
     """
-    angle_rad = np.deg2rad(angle_deg)
+    C_voigt = C_voigt_gpa * 1e9 # Convert GPa to Pa
+    C_full = np.zeros((3, 3, 3, 3))
+    # Mapeamento de Voigt
+    voigt_map = [
+        (0, 0), (1, 1), (2, 2),
+        (1, 2), (0, 2), (0, 1)
+    ]
     
-    # Simplified C_ij mapping for orthotropic material
-    C11, C22, C12, C66 = C_vals
-    
-    # Simplified velocity calculation (conceptual, not exact Christoffel)
-    # Longitudinal-like velocity
-    v_longitudinal = np.sqrt((C11 * np.cos(angle_rad)**2 + C22 * np.sin(angle_rad)**2 + 2 * C12 * np.cos(angle_rad) * np.sin(angle_rad) + C66) / rho)
-    # Shear-like velocity (simplified)
-    v_shear = np.sqrt((C66 * np.cos(angle_rad)**2 + C66 * np.sin(angle_rad)**2) / rho) # Simplified, often C44, C55, C66 are different
-    
-    return v_longitudinal, v_shear
-
-# Módulo 2: Ultrasonic Signal Simulation
-def simulate_ultrasonic_signal(frequency_MHz, duration_us, noise_level, TOF_us):
-    """Simula um sinal ultrassônico com ruído e um pulso."""
-    sampling_rate_MHz = 100 # 100 MS/s
-    time = np.linspace(0, duration_us, int(duration_us * sampling_rate_MHz))
-    
-    # Simulate a noisy baseline
-    signal = np.random.normal(0, noise_level, len(time))
-    
-    # Simulate a pulse at TOF
-    pulse_start_idx = int(TOF_us * sampling_rate_MHz)
-    if pulse_start_idx < len(time):
-        pulse_duration_samples = int(1.5 * sampling_rate_MHz / frequency_MHz) # ~1.5 cycles
-        pulse_amplitude = 1.0
-        
-        # Ricker wavelet or simple sine burst
-        t_pulse = np.linspace(-pulse_duration_samples / sampling_rate_MHz / 2, 
-                              pulse_duration_samples / sampling_rate_MHz / 2, 
-                              pulse_duration_samples)
-        
-        # Simple sine burst with Gaussian envelope
-        envelope = np.exp(-t_pulse**2 / (2 * (0.2 / frequency_MHz)**2))
-        pulse = pulse_amplitude * np.sin(2 * np.pi * frequency_MHz * t_pulse) * envelope
-        
-        end_idx = pulse_start_idx + len(pulse)
-        if end_idx > len(time):
-            pulse = pulse[:len(time) - pulse_start_idx]
-            end_idx = len(time)
+    for i in range(6):
+        for j in range(6):
+            idx_i = voigt_map[i]
+            idx_j = voigt_map[j]
             
-        signal[pulse_start_idx:end_idx] += pulse
+            # Ajuste para os termos de cisalhamento (fator 2)
+            factor_i = 1 if i < 3 else 2
+            factor_j = 1 if j < 3 else 2
+            
+            C_full[idx_i[0], idx_i[1], idx_j[0], idx_j[1]] = C_voigt[i, j]
+            
+    # Para ortotrópico, precisamos preencher os termos simétricos corretamente
+    # C_ijkl = C_jikl = C_ijlk = C_klij
+    # A matriz de Voigt já deve ser simétrica.
+    # A conversão direta já lida com a maioria.
+    # Para os termos de cisalhamento, C_44 = C_2323, C_55 = C_1313, C_66 = C_1212
+    # E suas permutações.
+    
+    # Para ortotrópico, a matriz de Voigt já é suficiente para o Christoffel.
+    # A conversão para o tensor completo é mais complexa e geralmente não é feita
+    # explicitamente para o Christoffel, que usa a forma contraída.
+    # Vamos usar a forma contraída diretamente no ChristoffelSolver.
+    return C_voigt # Retorna a matriz de Voigt em Pa
+
+def get_orthotropic_C_voigt(params_gpa):
+    """
+    Constrói a matriz de rigidez 6x6 (Voigt) para um material ortotrópico
+    a partir dos 9 parâmetros independentes.
+    """
+    C_voigt = np.zeros((6, 6))
+    C_voigt[0, 0] = params_gpa['C11']
+    C_voigt[1, 1] = params_gpa['C22']
+    C_voigt[2, 2] = params_gpa['C33']
+    C_voigt[0, 1] = C_voigt[1, 0] = params_gpa['C12']
+    C_voigt[0, 2] = C_voigt[2, 0] = params_gpa['C13']
+    C_voigt[1, 2] = C_voigt[2, 1] = params_gpa['C23']
+    C_voigt[3, 3] = params_gpa['C44']
+    C_voigt[4, 4] = params_gpa['C55']
+    C_voigt[5, 5] = params_gpa['C66']
+    return C_voigt * 1e9 # Retorna em Pa
+def get_params_from_C_voigt(C_voigt_pa):
+    """
+    Extrai os 9 parâmetros independentes de uma matriz de rigidez 6x6 (Voigt)
+    para um material ortotrópico. Retorna em GPa.
+    """
+    C_voigt_gpa = C_voigt_pa / 1e9
+    params_gpa = {
+        'C11': C_voigt_gpa[0, 0], 'C22': C_voigt_gpa[1, 1], 'C33': C_voigt_gpa[2, 2],
+        'C12': C_voigt_gpa[0, 1], 'C13': C_voigt_gpa[0, 2], 'C23': C_voigt_gpa[1, 2],
+        'C44': C_voigt_gpa[3, 3], 'C55': C_voigt_gpa[4, 4], 'C66': C_voigt_gpa[5, 5]
+    }
+    return params_gpa
+def get_param_vector_from_dict(params_dict):
+    """Converte o dicionário de parâmetros para um vetor numpy ordenado."""
+    return np.array([
+        params_dict['C11'], params_dict['C22'], params_dict['C33'],
+        params_dict['C12'], params_dict['C13'], params_dict['C23'],
+        params_dict['C44'], params_dict['C55'], params_dict['C66']
+    ])
+def get_param_dict_from_vector(param_vector):
+    """Converte um vetor numpy ordenado para o dicionário de parâmetros."""
+    return {
+        'C11': param_vector[0], 'C22': param_vector[1], 'C33': param_vector[2],
+        'C12': param_vector[3], 'C13': param_vector[4], 'C23': param_vector[5],
+        'C44': param_vector[6], 'C55': param_vector[7], 'C66': param_vector[8]
+    }
+# --- 1. MÓDULO 1: Solver Christoffel Exato ---
+class ChristoffelSolver:
+    """
+    Implementa o solver exato da equação de Christoffel para materiais anisotrópicos.
+    Calcula as velocidades de fase e vetores de polarização para uma dada direção.
+    """
+    def __init__(self):
+        pass
+
+    def _get_christoffel_matrix(self, C_voigt_pa, n):
+        """
+        Calcula a matriz de Christoffel (3x3) para uma dada direção de propagação n.
+        C_voigt_pa: Matriz de rigidez 6x6 em Pa.
+        n: Vetor unitário de direção de propagação [n1, n2, n3].
+        """
+        n1, n2, n3 = n
+        Gamma = np.zeros((3, 3))
+        # Simplificado para ortotrópico
+        Gamma[0,0] = C_voigt_pa[0,0]*n1**2 + C_voigt_pa[5,5]*n2**2 + C_voigt_pa[4,4]*n3**2
+        Gamma[1,1] = C_voigt_pa[5,5]*n1**2 + C_voigt_pa[1,1]*n2**2 + C_voigt_pa[3,3]*n3**2
+        Gamma[2,2] = C_voigt_pa[4,4]*n1**2 + C_voigt_pa[3,3]*n2**2 + C_voigt_pa[2,2]*n3**2
+        Gamma[0,1] = Gamma[1,0] = (C_voigt_pa[0,1] + C_voigt_pa[5,5])*n1*n2
+        Gamma[0,2] = Gamma[2,0] = (C_voigt_pa[0,2] + C_voigt_pa[4,4])*n1*n3
+        Gamma[1,2] = Gamma[2,1] = (C_voigt_pa[1,2] + C_voigt_pa[3,3])*n2*n3
+        return Gamma
+
+    def solve(self, C_voigt_pa, rho, n):
+        """
+        Resolve a equação de Christoffel para as velocidades de fase e polarizações.
+        C_voigt_pa: Matriz de rigidez 6x6 em Pa.
+        rho: Densidade em kg/m^3.
+        n: Vetor unitário de direção de propagação [n1, n2, n3].
+        Retorna: (velocidades_fase, vetores_polarizacao, modos_identificados)
+        """
+        if not np.isclose(np.linalg.norm(n), 1.0):
+            raise ValueError("Vetor de direção n deve ser unitário.")
+        Gamma = self._get_christoffel_matrix(C_voigt_pa, n)
+        eigenvalues, eigenvectors = la.eigh(Gamma)
+        eigenvalues[eigenvalues < 0] = 0
+        v_squared = eigenvalues / rho
+        velocities = np.sqrt(v_squared)
+        dot_products = np.abs(np.dot(eigenvectors.T, n))
+        qP_idx = np.argmax(dot_products)
+        qS_indices = [i for i in range(3) if i != qP_idx]
+        ordered_indices = [qP_idx] + qS_indices
+        ordered_velocities = velocities[ordered_indices]
+        ordered_eigenvectors = eigenvectors[:, ordered_indices]
+        modes = ["qP", "qS1", "qS2"]
+        return ordered_velocities, ordered_eigenvectors, modes
+
+# --- 2. MÓDULO 2: Modelo Ultrassônico Realista ---
+class UltrasonicModel:
+   #Simula o comportamento de ondas ultrassônicas em um material compósito,incluindo TOF, atenuação e uma representação simplificada de dispersão.
+    
+    def __init__(self, christoffel_solver):
+        self.christoffel_solver = christoffel_solver
+
+    def predict_tof(self, C_voigt_pa, rho, thickness_m, n, mode_idx=0):
+        """
+        Prevê o Tempo de Voo (TOF) para um modo específico.
+        mode_idx: 0 para qP, 1 para qS1, 2 para qS2.
+        """
+        try:
+            velocities, _, _ = self.christoffel_solver.solve(C_voigt_pa, rho, n)
+            phase_velocity = velocities[mode_idx]
+            if phase_velocity <= 0:
+                return np.inf # Velocidade não física
+            tof = thickness_m / phase_velocity
+            return tof
+        except ValueError: # Erro do solver Christoffel
+            return np.inf
+        except IndexError: # mode_idx inválido
+            return np.inf
+
+    def predict_attenuation(self, C_voigt_pa, rho, n, frequency_hz, thickness_m, 
+                            mode_idx=0, loss_factor_base=0.01, loss_factor_freq_exp=1.0):
+        """
+        Prevê a atenuação em dB para um modo específico.
+        Modelo simplificado de atenuação viscoelástica: alpha = (pi * f * loss_factor) / v
+        loss_factor_base: Fator de perda base (adimensional).
+        loss_factor_freq_exp: Expoente da dependência da frequência (1.0 para linear).
+        """
+        try:
+            velocities, _, _ = self.christoffel_solver.solve(C_voigt_pa, rho, n)
+            phase_velocity = velocities[mode_idx]
+            if phase_velocity <= 0:
+                return np.inf
+            
+            # Fator de perda pode depender da direção e do modo, mas aqui simplificamos
+            # para um valor base e dependência da frequência.
+            loss_factor = loss_factor_base * (frequency_hz / 1e6)**loss_factor_freq_exp # Normaliza freq para MHz
+            
+            alpha_np = (np.pi * frequency_hz * loss_factor) / phase_velocity # Coeficiente de atenuação neperiano (Np/m)
+            
+            attenuation_db = 20 * np.log10(np.exp(alpha_np * thickness_m)) # Atenuação em dB
+            return attenuation_db
+        except ValueError:
+            return np.inf
+        except IndexError:
+            return np.inf
+
+    def simulate_signal(self, C_voigt_pa, rho, thickness_m, n, frequency_hz, 
+                        mode_idx=0, noise_level=0.05, loss_factor_base=0.01, 
+                        loss_factor_freq_exp=1.0, dt=1e-8, num_points=1000):
+        """
+        Simula um sinal ultrassônico de pulso-eco (simplificado).
+        Gera um pulso Ricker, aplica TOF, atenuação e adiciona ruído.
+        """
+        tof = self.predict_tof(C_voigt_pa, rho, thickness_m, n, mode_idx)
+        attenuation_db = self.predict_attenuation(C_voigt_pa, rho, n, frequency_hz, 
+thickness_m, mode_idx, loss_factor_base,
+loss_factor_freq_exp)
+        if tof == np.inf or attenuation_db == np.inf:
+            return np.linspace(0, num_points * dt, num_points), np.zeros(num_points)
+
+        # Pulso Ricker (derivada segunda de Gaussiana)
+        t = np.linspace(-5/frequency_hz, 5/frequency_hz, num_points)
+        ricker_pulse = (1 - 2 * (np.pi * frequency_hz * t)**2) * np.exp(-(np.pi * frequency_hz * t)**2)
         
-    return time, signal
-
-def calculate_velocity_and_uncertainty(h_mm, delta_h_mm, TOF_us, delta_TOF_us, technique="Transmissão"):
-    """Calcula velocidade e propaga incertezas."""
-    h_m = h_mm / 1000
-    delta_h_m = delta_h_mm / 1000
-    TOF_s = TOF_us / 1e6
-    delta_TOF_s = delta_TOF_us / 1e6
-
-    if technique == "Transmissão":
-        v = h_m / TOF_s
-        # Error propagation for v = h/TOF
-        delta_v_rel = np.sqrt((delta_h_m / h_m)**2 + (delta_TOF_s / TOF_s)**2)
-    else: # Reflexão
-        v = (2 * h_m) / TOF_s
-        # Error propagation for v = 2h/TOF
-        delta_v_rel = np.sqrt((delta_h_m / h_m)**2 + (delta_TOF_s / TOF_s)**2)
+        # Escala de tempo para o sinal completo
+        time_axis = np.linspace(0, num_points * dt, num_points)
         
-    delta_v = v * delta_v_rel
-    return v, delta_v
+        # Atraso do pulso
+        shifted_pulse = np.interp(time_axis - tof, t, ricker_pulse, left=0, right=0)
+        
+        # Aplica atenuação (converte dB para fator linear)
+        attenuation_factor = 10**(-attenuation_db / 20)
+        attenuated_pulse = shifted_pulse * attenuation_factor
+        
+        # Adiciona ruído Gaussiano
+        noise = np.random.normal(0, noise_level * np.max(np.abs(attenuated_pulse)), num_points)
+        final_signal = attenuated_pulse + noise
+        
+        return time_axis, final_signal
 
-# Módulo 3: Bayesian Inference Concepts
-def simulate_likelihood_prior_posterior(v_exp, sigma_exp, prior_mean, prior_std, param_range=(0, 200)):
-    """Simula distribuições de prior, likelihood e posterior para um único parâmetro."""
-    param_values = np.linspace(param_range[0], param_range[1], 500)
-    
-    # Prior (Gaussian for simplicity)
-    prior_dist = norm.pdf(param_values, loc=prior_mean, scale=prior_std)
-    
-    # Likelihood (assuming v_pred = param_value for simplicity)
-    # In a real scenario, v_pred would come from the forward model
-    likelihood_dist = norm.pdf(v_exp, loc=param_values, scale=sigma_exp)
-    
-    # Posterior (unnormalized)
-    posterior_unnorm = likelihood_dist * prior_dist
-    
-    # Normalize posterior for plotting
-    posterior_dist = posterior_unnorm / trapezoid(posterior_unnorm, param_values)
-    
-    return param_values, prior_dist, likelihood_dist, posterior_dist
+# --- 3. MÓDULO 3: Likelihood Bayesiana Precisa ---
+class BayesianLikelihood:
+    """
+    Calcula a função de verossimilhança (likelihood) para o modelo Bayesiano,
+    assumindo erros Gaussianos.
+    """
+    def __init__(self, ultrasonic_model: UltrasonicModel):
+        self.ultrasonic_model = ultrasonic_model
 
-# Módulo 4: MCMC Simulation
-def simulate_mcmc_chain(num_iterations, step_size, true_value, initial_value, likelihood_std, prior_mean, prior_std):
-    """Simula uma cadeia MCMC Metropolis-Hastings para um único parâmetro."""
-    samples = np.zeros(num_iterations)
-    current_param = initial_value
-    accepted_count = 0
+    def log_likelihood(self, params_gpa, rho, experimental_data):
+        """
+        Calcula o log da verossimilhança para um conjunto de parâmetros (C_ij, rho).
+        experimental_data: DataFrame com colunas 'direction_n', 'mode_idx', 'v_exp', 'sigma_exp'.
+        """
+        C_voigt_pa = get_orthotropic_C_voigt(params_gpa)
+        
+        log_like = 0.0
+        for _, row in experimental_data.iterrows():
+            n = np.array(row['direction_n'])
+            mode_idx = row['mode_idx']
+            v_exp = row['v_exp']
+            sigma_exp = row['sigma_exp']
+            thickness_m = row['thickness_m'] # Assumindo thickness_m está no DataFrame
+            
+            # Prever TOF e converter para velocidade
+            tof_pred = self.ultrasonic_model.predict_tof(C_voigt_pa, rho, thickness_m, n, mode_idx)
+            if tof_pred == np.inf or tof_pred <= 0:
+                return -np.inf # Parâmetros não físicos
+            v_pred = thickness_m / tof_pred # Velocidade prevista
+            
+            # Termo da likelihood Gaussiana
+            log_like += norm.logpdf(v_exp, loc=v_pred, scale=sigma_exp)
+            
+        return log_like
 
-    # Simplified log-posterior function for a single parameter
-    def log_posterior_func(param):
-        if not (0 < param < 200): # Simple bounds
+    def log_prior(self, params_gpa, rho, prior_bounds_gpa, rho_prior_bounds):
+        """
+        Calcula o log do prior para um conjunto de parâmetros.
+        Assume priors uniformes para C_ij e rho.
+        """
+        # Prior para C_ij
+        for param_name, value in params_gpa.items():
+            if not (prior_bounds_gpa[param_name][0] <= value <= prior_bounds_gpa[param_name][1]):
+                return -np.inf
+        
+        # Prior para rho
+        if not (rho_prior_bounds[0] <= rho <= rho_prior_bounds[1]):
             return -np.inf
-        log_prior = norm.logpdf(param, loc=prior_mean, scale=prior_std)
-        # Simulate likelihood: assume true_value is the "measured" value
-        log_likelihood = norm.logpdf(true_value, loc=param, scale=likelihood_std)
-        return log_prior + log_likelihood
-
-    current_log_post = log_posterior_func(current_param)
-
-    for i in range(num_iterations):
-        # Propose a new parameter value
-        proposed_param = current_param + np.random.normal(0, step_size)
-        
-        # Calculate log-posterior for proposed value
-        proposed_log_post = log_posterior_func(proposed_param)
-        
-        # Calculate acceptance ratio
-        alpha = np.exp(proposed_log_post - current_log_post)
-        
-        # Accept or reject
-        if np.random.rand() < alpha:
-            current_param = proposed_param
-            current_log_post = proposed_log_post
-            accepted_count += 1
-        
-        samples[i] = current_param
-        
-    acceptance_rate = accepted_count / num_iterations
-    
-    # Simulate R_hat and ESS (conceptual values for demonstration)
-    r_hat = 1.0 + (np.random.rand() * 0.2 if acceptance_rate < 0.2 or acceptance_rate > 0.5 else np.random.rand() * 0.05)
-    ess = num_iterations * (acceptance_rate * 0.5) # Simplified relation
-    
-    return samples, acceptance_rate, r_hat, ess
-
-# Módulo 5: Sensitivity and Validation
-def simulate_posterior_samples(num_samples, prior_mean, prior_std, true_value, likelihood_std, correlation_strength=0.0):
-    """Simula amostras posteriores para 2 parâmetros com correlação."""
-    # Simulate a more informative posterior than prior
-    posterior_std = prior_std / (1 + np.random.rand() * 2) # Posterior is narrower
-    
-    # Simulate samples for C11
-    C11_samples = np.random.normal(true_value, posterior_std, num_samples)
-    
-    # Simulate samples for C12, potentially correlated with C11
-    if correlation_strength != 0:
-        # Create correlated samples
-        mean = [true_value, true_value * 0.05] # C12 is typically much smaller than C11
-        cov = [[posterior_std**2, correlation_strength * posterior_std * (posterior_std/5)], 
-               [correlation_strength * posterior_std * (posterior_std/5), (posterior_std/5)**2]]
-        
-        samples_2d = np.random.multivariate_normal(mean, cov, num_samples)
-        C11_samples = samples_2d[:, 0]
-        C12_samples = samples_2d[:, 1]
-    else:
-        C12_samples = np.random.normal(true_value * 0.05, posterior_std / 5, num_samples)
-
-    # Simulate prior samples for comparison
-    C11_prior_samples = np.random.normal(prior_mean, prior_std, num_samples)
-    C12_prior_samples = np.random.normal(prior_mean * 0.05, prior_std / 5, num_samples)
-    
-    return C11_samples, C12_samples, C11_prior_samples, C12_prior_samples
-
-# --- Module Functions ---
-
-def module1_fundamentals():
-    st.header("Módulo 1: Fundamentos de Propagação de Ondas")
-    st.markdown("""
-    Este módulo explora como as propriedades elásticas de um compósito anisotrópico afetam a velocidade de propagação das ondas ultrassônicas.
-    A Equação de Christoffel é a base para relacionar as constantes elásticas (C_ij) com as velocidades de onda em diferentes direções.
-    """)
-
-    st.subheader("Parâmetros do Material (Simplificado)")
-    col1, col2 = st.columns(2)
-    with col1:
-        C11 = st.slider("C₁₁ (GPa)", 50, 200, 140, 5) * 1e9
-        C22 = st.slider("C₂₂ (GPa)", 5, 20, 10, 1) * 1e9
-        C12 = st.slider("C₁₂ (GPa)", 2, 10, 5, 1) * 1e9
-    with col2:
-        C66 = st.slider("C₆₆ (GPa)", 3, 15, 7, 1) * 1e9
-        rho = st.slider("Densidade (kg/m³)", 1000, 2000, 1550, 50)
-        
-    st.subheader("Direção de Propagação")
-    angle_deg = st.slider("Ângulo de Propagação (graus no plano 1-2)", 0, 90, 0, 5)
-
-    if st.button("Calcular Velocidades"):
-        C_vals = (C11, C22, C12, C66)
-        v_long, v_shear = simulate_christoffel_velocities(C_vals, rho, angle_deg)
-        
-        st.write(f"**Velocidade Longitudinal (simulada):** {v_long/1000:.2f} km/s")
-        st.write(f"**Velocidade Cisalhante (simulada):** {v_shear/1000:.2f} km/s")
-        
-        st.markdown("---")
-        st.subheader("Dependência Angular da Velocidade (Exemplo Conceitual)")
-        angles = np.linspace(0, 90, 19)
-        v_long_plot = []
-        v_shear_plot = []
-        for a in angles:
-            vl, vs = simulate_christoffel_velocities(C_vals, rho, a)
-            v_long_plot.append(vl / 1000)
-            v_shear_plot.append(vs / 1000)
             
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(angles, v_long_plot, label="Velocidade Longitudinal", marker='o')
-        ax.plot(angles, v_shear_plot, label="Velocidade Cisalhante", marker='x')
-        ax.set_xlabel("Ângulo de Propagação (graus)")
-        ax.set_ylabel("Velocidade (km/s)")
-        ax.set_title("Velocidade de Onda vs. Ângulo de Propagação (Simulado)")
-        ax.legend()
-        ax.grid(True)
-        st.pyplot(fig)
-        plt.close(fig)
+        # Priors uniformes têm densidade constante dentro dos limites,
+        # então o log da densidade é constante (e pode ser ignorado para MCMC)
+        # ou log(1/range). Aqui, retornamos 0 se dentro dos limites.
+        return 0.0
 
-def module2_ultrasound_measurement():
-    st.header("Módulo 2: Medição por Ultrassom e Incertezas")
-    st.markdown("""
-    Este módulo demonstra como as velocidades de onda são extraídas de sinais ultrassônicos e como as incertezas experimentais são propagadas.
-    """)
+    def log_posterior(self, params_gpa, rho, experimental_data, prior_bounds_gpa, rho_prior_bounds):
+        """
+        Calcula o log da posterior (log_likelihood + log_prior).
+        """
+        lp = self.log_prior(params_gpa, rho, prior_bounds_gpa, rho_prior_bounds)
+        if lp == -np.inf:
+            return -np.inf
+        
+        ll = self.log_likelihood(params_gpa, rho, experimental_data)
+        
+        return lp + ll
 
-    st.subheader("Parâmetros da Medição")
-    col1, col2 = st.columns(2)
-    with col1:
-        h_mm = st.slider("Espessura da Amostra (mm)", 1.0, 10.0, 5.0, 0.1)
-        delta_h_mm = st.slider("Incerteza na Espessura (mm)", 0.01, 0.1, 0.05, 0.01)
-    with col2:
-        TOF_us = st.slider("Tempo de Voo (TOF) (µs)", 1.0, 5.0, 2.5, 0.1)
-        delta_TOF_us = st.slider("Incerteza no TOF (µs)", 0.001, 0.1, 0.02, 0.001)
-    
-    technique = st.radio("Técnica de Medição", ["Transmissão", "Reflexão"])
+# --- 4. MÓDULO 4: MCMC Metropolis-Hastings ---
+class MCMCSampler:
+    """
+Implementa o algoritmo Metropolis-Hastings para amostragem da distribuição posterior.
+Inclui adaptação da covariância da proposta e diagnósticos de convergência.
+    """
+    def __init__(self, bayesian_likelihood: BayesianLikelihood):
+        self.bayesian_likelihood = bayesian_likelihood
 
-    if st.button("Calcular Velocidade e Incerteza"):
-        v, delta_v = calculate_velocity_and_uncertainty(h_mm, delta_h_mm, TOF_us, delta_TOF_us, technique)
+    def _run_chain(self, chain_id, initial_state, n_iter, burn_in, proposal_cov_initial, 
+                   experimental_data, prior_bounds_gpa, rho_prior_bounds, adapt_interval=100):
+        """
+        Função para rodar uma única cadeia MCMC.
+        Retorna amostras, log_posteriors e taxa de aceitação.
+        """
+        n_params = len(initial_state) - 1 # C_params + rho
         
-        st.write(f"**Velocidade Calculada:** {v:.2f} m/s")
-        st.write(f"**Incerteza na Velocidade:** ± {delta_v:.2f} m/s ({delta_v/v*100:.2f}%)")
+        samples = np.zeros((n_iter, n_params + 1))
+        log_posteriors = np.zeros(n_iter)
         
-        st.markdown("---")
-        st.subheader("Sinal Ultrassônico Simulado")
+        current_params_gpa = get_param_dict_from_vector(initial_state[:-1])
+        current_rho = initial_state[-1]
         
-        freq_MHz = st.slider("Frequência do Transdutor (MHz)", 1.0, 10.0, 5.0, 0.5)
-        noise_lvl = st.slider("Nível de Ruído", 0.01, 0.5, 0.1, 0.01)
-        
-        time_signal, signal_data = simulate_ultrasonic_signal(freq_MHz, TOF_us * 2, noise_lvl, TOF_us)
-        
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.plot(time_signal, signal_data)
-        ax.axvline(x=TOF_us, color='r', linestyle='--', label=f'TOF = {TOF_us} µs')
-        ax.set_xlabel("Tempo (µs)")
-        ax.set_ylabel("Amplitude")
-        ax.set_title("Sinal Ultrassônico Simulado")
-        ax.legend()
-        ax.grid(True)
-        st.pyplot(fig)
-        plt.close(fig)
-
-def module3_bayesian_inference():
-    st.header("Módulo 3: Inferência Bayesiana: Conceitos")
-    st.markdown("""
-    Este módulo ilustra os componentes fundamentais da inferência Bayesiana: o Prior, a Likelihood e a Posterior.
-    Vamos simular a estimativa de um único parâmetro (e.g., C₁₁) a partir de uma medição.
-    """)
-
-    st.subheader("Dados Observados (Simulados)")
-    v_exp = st.slider("Velocidade Medida (v_exp, m/s)", 1000, 10000, 7400, 100)
-    sigma_exp = st.slider("Incerteza da Medição (σ_exp, m/s)", 10, 200, 50, 10)
-
-    st.subheader("Conhecimento Pré-existente (Prior)")
-    prior_mean = st.slider("Média do Prior (m/s)", 1000, 10000, 7000, 100)
-    prior_std = st.slider("Desvio Padrão do Prior (m/s)", 100, 2000, 1000, 100)
-    
-    param_range_min = min(v_exp - 3*sigma_exp, prior_mean - 3*prior_std) - 500
-    param_range_max = max(v_exp + 3*sigma_exp, prior_mean + 3*prior_std) + 500
-    
-    if st.button("Visualizar Distribuições"):
-        param_values, prior_dist, likelihood_dist, posterior_dist = \
-            simulate_likelihood_prior_posterior(v_exp, sigma_exp, prior_mean, prior_std, 
-                                                param_range=(param_range_min, param_range_max))
-        
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(param_values, prior_dist, label="Prior", linestyle='--')
-        ax.plot(param_values, likelihood_dist, label="Likelihood")
-        ax.plot(param_values, posterior_dist, label="Posterior", linewidth=2, color='red')
-        
-        ax.axvline(x=v_exp, color='gray', linestyle=':', label=f'v_exp = {v_exp} m/s')
-        
-        ax.set_xlabel("Valor do Parâmetro (e.g., C₁₁ equivalente em m/s)")
-        ax.set_ylabel("Densidade de Probabilidade")
-        ax.set_title("Prior, Likelihood e Posterior (Conceitual)")
-        ax.legend()
-        ax.grid(True)
-        st.pyplot(fig)
-        plt.close(fig)
-        
-        st.markdown("---")
-        st.subheader("Interpretação")
-        st.write(f"**Média do Prior:** {prior_mean:.0f} m/s, **SD do Prior:** {prior_std:.0f} m/s")
-        st.write(f"**Média da Likelihood (dada v_exp):** {v_exp:.0f} m/s, **SD da Likelihood:** {sigma_exp:.0f} m/s")
-        
-        posterior_mean = trapezoid(param_values * posterior_dist, param_values)
-        posterior_std = np.sqrt(trapezoid((param_values - posterior_mean)**2 * posterior_dist, param_values))
-        
-        st.write(f"**Média da Posterior:** {posterior_mean:.0f} m/s, **SD da Posterior:** {posterior_std:.0f} m/s")
-        st.markdown(f"""
-        - O **Prior** representa nosso conhecimento inicial sobre o parâmetro.
-        - A **Likelihood** mostra quão prováveis são os dados observados para cada valor possível do parâmetro.
-        - A **Posterior** é a combinação do Prior e da Likelihood, representando nosso conhecimento atualizado sobre o parâmetro após observar os dados.
-        - Observe como a posterior é mais estreita que o prior, indicando uma **redução da incerteza** devido aos dados.
-        """)
-
-def module4_mcmc_algorithms():
-    st.header("Módulo 4: Algoritmos MCMC em Ação")
-    st.markdown("""
-    Este módulo demonstra o funcionamento do algoritmo Metropolis-Hastings para amostrar a distribuição posterior.
-    """)
-
-    st.subheader("Configuração MCMC (para um único parâmetro)")
-    col1, col2 = st.columns(2)
-    with col1:
-        num_iterations = st.slider("Número de Iterações", 1000, 50000, 10000, 1000)
-        step_size = st.slider("Tamanho do Passo (Step Size)", 0.1, 100.0, 10.0, 0.1)
-        initial_value = st.slider("Valor Inicial da Cadeia", 1000, 10000, 6000, 100)
-    with col2:
-        true_value = st.slider("Valor 'Verdadeiro' Simulado (para Likelihood)", 1000, 10000, 7400, 100)
-        likelihood_std = st.slider("Desvio Padrão da Likelihood", 10, 200, 50, 10)
-        prior_mean = st.slider("Média do Prior (para MCMC)", 1000, 10000, 7000, 100)
-        prior_std = st.slider("Desvio Padrão do Prior (para MCMC)", 100, 2000, 1000, 100)
-
-    if st.button("Rodar MCMC"):
-        samples, acceptance_rate, r_hat, ess = simulate_mcmc_chain(
-            num_iterations, step_size, true_value, initial_value, likelihood_std, prior_mean, prior_std
+        current_log_post = self.bayesian_likelihood.log_posterior(
+            current_params_gpa, current_rho, experimental_data, prior_bounds_gpa, rho_prior_bounds
         )
         
-        st.markdown("---")
-        st.subheader("Resultados da Cadeia MCMC")
+        accepted_count = 0
         
-        col_metrics1, col_metrics2 = st.columns(2)
-        with col_metrics1:
-            st.metric("Taxa de Aceitação", f"{acceptance_rate*100:.2f}%")
-            st.metric("R̂ (Gelman-Rubin)", f"{r_hat:.2f}")
-        with col_metrics2:
-            st.metric("ESS (Effective Sample Size)", f"{int(ess)}")
+        # Adaptação da covariância da proposta
+        proposal_cov = proposal_cov_initial.copy()
+        
+        for i in range(n_iter):
+            # Propor novo estado
+            proposed_state = multivariate_normal.rvs(mean=initial_state, cov=proposal_cov)
+            proposed_params_gpa = get_param_dict_from_vector(proposed_state[:-1])
+            proposed_rho = proposed_state[-1]
             
-        st.markdown("""
-        **Interpretação das Métricas:**
-        - **Taxa de Aceitação:** Idealmente entre 20-40%. Baixa demais indica passos muito grandes; alta demais indica passos muito pequenos.
-        - **R̂ (Gelman-Rubin):** Deve ser próximo de 1.00 (tipicamente < 1.05) para indicar convergência.
-        - **ESS:** Número de amostras independentes efetivas. Deve ser alto o suficiente (ex: > 400) para inferências confiáveis.
+            proposed_log_post = self.bayesian_likelihood.log_posterior(
+                proposed_params_gpa, proposed_rho, experimental_data, prior_bounds_gpa, rho_prior_bounds
+            )
+            
+            # Calcular razão de aceitação (em escala logarítmica)
+            log_alpha = proposed_log_post - current_log_post
+            alpha = min(1.0, np.exp(log_alpha))
+            
+            # Aceitar ou rejeitar
+            if np.random.rand() < alpha:
+                current_params_gpa = proposed_params_gpa
+                current_rho = proposed_rho
+                current_log_post = proposed_log_post
+                initial_state = proposed_state # Atualiza para próxima proposta
+                accepted_count += 1
+            
+            samples[i, :-1] = get_param_vector_from_dict(current_params_gpa)
+            samples[i, -1] = current_rho
+            log_posteriors[i] = current_log_post
+
+            # Adaptação da covariância da proposta (durante burn-in)
+            if i < burn_in and (i + 1) % adapt_interval == 0:
+                current_acceptance_rate = accepted_count / (i + 1)
+                if current_acceptance_rate < 0.2: # Muito baixa, reduzir passo
+                    proposal_cov *= 0.8
+                elif current_acceptance_rate > 0.5: # Muito alta, aumentar passo
+                    proposal_cov *= 1.2
+                # Reset accepted_count for next adaptation interval
+                accepted_count = 0 
+        
+        acceptance_rate = accepted_count / n_iter
+        return samples, log_posteriors, acceptance_rate
+
+    def sample(self, initial_states, n_iter, burn_in, proposal_scale, 
+               experimental_data, prior_bounds_gpa, rho_prior_bounds):
+        """
+        Roda múltiplas cadeias MCMC em sequência (sem multiprocessing).
+        Isso evita problemas de pickling com classes definidas em __main__.
+        """
+        n_chains = len(initial_states)
+        n_params = len(initial_states[0]) # C_params + rho
+
+        # Covariância inicial da proposta (diagonal)
+        proposal_cov_initial = np.eye(n_params) * proposal_scale**2
+
+        st.write(f"Iniciando {n_chains} cadeias MCMC com {n_iter} iterações cada (burn-in: {burn_in}).")
+
+        all_samples = []
+        all_log_posteriors = []
+        all_acceptance_rates = []
+
+        for i in range(n_chains):
+            samples, log_posteriors, acceptance_rate = self._run_chain(
+                i, initial_states[i], n_iter, burn_in, proposal_cov_initial,
+                experimental_data, prior_bounds_gpa, rho_prior_bounds
+            )
+            all_samples.append(samples)
+            all_log_posteriors.append(log_posteriors)
+            all_acceptance_rates.append(acceptance_rate)
+
+        return all_samples, all_log_posteriors, all_acceptance_rates
+
+    def calculate_rhat(self, all_samples, burn_in):
+        """
+        Calcula a estatística R-hat de Gelman-Rubin para cada parâmetro.
+        """
+        if len(all_samples) < 2:
+            return None # R-hat requer pelo menos 2 cadeias
+        
+        n_chains = len(all_samples)
+        n_params = all_samples[0].shape[1]
+        
+        rhat_values = np.zeros(n_params)
+        
+        for p in range(n_params):
+            chain_samples = np.array([s[burn_in:, p] for s in all_samples])
+            
+            # Variância dentro da cadeia (W)
+            W = np.mean(np.var(chain_samples, axis=1, ddof=1))
+            
+            # Variância entre cadeias (B)
+            chain_means = np.mean(chain_samples, axis=1)
+            B = len(chain_samples[0]) * np.var(chain_means, ddof=1)
+            
+            # Estimativa da variância posterior (V_hat)
+            V_hat = (len(chain_samples[0]) - 1) / len(chain_samples[0]) * W + (1 / len(chain_samples[0])) * B
+            
+            rhat_values[p] = np.sqrt(V_hat / W) if W > 0 else np.nan # Evitar divisão por zero
+            
+        return rhat_values
+
+    def calculate_ess(self, all_samples, burn_in):
+        """
+        Calcula o Effective Sample Size (ESS) para cada parâmetro.
+        Simplificado: usa a autocorrelação de uma cadeia representativa.
+        Para uma implementação mais robusta, seria necessário um pacote como ArviZ.
+        """
+        if len(all_samples) == 0:
+            return None
+        
+        # Usar a primeira cadeia para estimar autocorrelação
+        representative_chain = all_samples[0][burn_in:, :]
+        n_params = representative_chain.shape[1]
+        
+        ess_values = np.zeros(n_params)
+        
+        for p in range(n_params):
+            samples_p = representative_chain[:, p]
+            
+            # Estimar autocorrelação (simplificado)
+            # Usar fft para calcular autocorrelação
+            n_eff = len(samples_p)
+            f = np.fft.fft(samples_p - np.mean(samples_p), n=2*n_eff)
+            acf = np.fft.ifft(f * np.conjugate(f))[:n_eff].real
+            acf /= acf[0] # Normalizar
+            
+            # Sum of positive autocorrelations
+            sum_rho_k = 0
+            for k in range(1, n_eff):
+                if acf[k] > 0:
+                    sum_rho_k += acf[k]
+                else:
+                    break # Stop when autocorrelation becomes negative
+            
+            ess_values[p] = n_eff / (1 + 2 * sum_rho_k)
+            
+        return ess_values
+
+# --- 5. MÓDULO 5: Validação Completa ---
+class ValidationTools:
+    """
+Fornece ferramentas para análise de sensibilidade, identificabilidade e validação
+do modelo Bayesiano.
+    """
+    def __init__(self, bayesian_likelihood: BayesianLikelihood):
+        self.bayesian_likelihood = bayesian_likelihood
+    def sensitivity_to_prior(self, posterior_samples, prior_bounds_gpa, rho_prior_bounds):
+        """
+        Compara a dispersão posterior com a dispersão do prior para avaliar a informatividade dos dados.
+        Retorna um DataFrame com SD_prior, SD_posterior e a razão.
+        """
+        param_names = list(prior_bounds_gpa.keys()) + ['rho']
+        
+        sd_prior = []
+        sd_posterior = np.std(posterior_samples, axis=0)
+        
+        for name in prior_bounds_gpa.keys():
+            lower, upper = prior_bounds_gpa[name]
+            sd_prior.append(uniform.std(loc=lower, scale=upper-lower))
+        
+        lower_rho, upper_rho = rho_prior_bounds
+        sd_prior.append(uniform.std(loc=lower_rho, scale=upper_rho-lower_rho))
+        
+        sd_prior = np.array(sd_prior)
+        
+        results = pd.DataFrame({
+            'Parâmetro': param_names,
+            'SD Prior': sd_prior,
+            'SD Posterior': sd_posterior,
+            'Razão (SD Prior/SD Post)': sd_prior / sd_posterior
+        })
+        return results
+
+    def identifiability_analysis(self, posterior_samples):
+        """
+        Calcula a matriz de correlação posterior para identificar parâmetros correlacionados.
+        """
+        correlation_matrix = np.corrcoef(posterior_samples, rowvar=False)
+        return correlation_matrix
+
+    def posterior_predictive_check(self, posterior_samples, experimental_data, n_simulations=100):
+        """
+        Realiza um Posterior Predictive Check (PPC).
+        Simula dados com base nas amostras posteriores e compara com os dados experimentais.
+        Retorna um DataFrame com v_exp, v_pred_mean, v_pred_std e um p-value Bayesiano.
+        """
+        n_exp_points = len(experimental_data)
+        simulated_velocities = np.zeros((n_simulations, n_exp_points))
+        
+        # Amostrar aleatoriamente do posterior para simular
+        sample_indices = np.random.choice(posterior_samples.shape[0], n_simulations, replace=False)
+        
+        for i, idx in enumerate(sample_indices):
+            params_gpa = get_param_dict_from_vector(posterior_samples[idx, :-1])
+            rho = posterior_samples[idx, -1]
+            C_voigt_pa = get_orthotropic_C_voigt(params_gpa)
+            
+            for j, (_, row) in enumerate(experimental_data.iterrows()):
+                n = np.array(row['direction_n'])
+                mode_idx = row['mode_idx']
+                thickness_m = row['thickness_m']
+                
+                tof_pred = self.bayesian_likelihood.ultrasonic_model.predict_tof(C_voigt_pa, rho, thickness_m, n, mode_idx)
+                if tof_pred == np.inf or tof_pred <= 0:
+                    simulated_velocities[i, j] = np.nan
+                else:
+                    simulated_velocities[i, j] = thickness_m / tof_pred
+        
+        # Calcular estatísticas das velocidades simuladas
+        v_pred_mean = np.nanmean(simulated_velocities, axis=0)
+        v_pred_std = np.nanstd(simulated_velocities, axis=0)
+        
+        # Calcular p-value Bayesiano (simplificado: proporção de vezes que a estatística simulada é maior que a observada)
+        # Usamos a estatística chi-quadrado como exemplo
+        chi2_obs = np.sum(((experimental_data['v_exp'].values - v_pred_mean) / experimental_data['sigma_exp'].values)**2)
+        
+        chi2_sim = np.zeros(n_simulations)
+        for i in range(n_simulations):
+            # Para cada simulação, calculamos o chi2 em relação à média preditiva
+            # Uma forma mais robusta seria comparar com os próprios dados simulados
+            chi2_sim[i] = np.sum(((simulated_velocities[i, :] - v_pred_mean) / experimental_data['sigma_exp'].values)**2)
+        
+        p_value_bayesian = np.mean(chi2_sim > chi2_obs)
+        
+        results = experimental_data.copy()
+        results['v_pred_mean'] = v_pred_mean
+        results['v_pred_std'] = v_pred_std
+        
+        return results, p_value_bayesian
+
+    def loo_cv_conceptual(self):
+        """
+        Apresenta uma explicação conceitual do Leave-One-Out Cross-Validation (LOO-CV),
+        já que a implementação completa é complexa e requer bibliotecas como ArviZ.
+        """
+        st.subheader("Leave-One-Out Cross-Validation (LOO-CV)")
+        st.write("""
+        O LOO-CV é uma técnica de validação cruzada que avalia a capacidade preditiva do modelo.
+        Para cada ponto de dado experimental, o modelo é treinado com *todos os outros* pontos
+        e, em seguida, a probabilidade de prever o ponto de dado "deixado de fora" é calculada.
+        
+        **Como funciona:**
+        1.  Para cada medição $v_i$ no conjunto de dados:
+            *   Treine o modelo Bayesiano usando todos os dados *exceto* $v_i$.
+            *   Use o modelo treinado para prever a distribuição de $v_i$.
+            *   Calcule a probabilidade logarítmica preditiva de $v_i$ dado o modelo treinado com os dados restantes.
+        2.  A soma dessas probabilidades logarítmicas preditivas (ELPD_LOO) é uma medida da capacidade
+            preditiva geral do modelo.
+        
+        **Benefícios:**
+        *   Fornece uma estimativa robusta da capacidade de generalização do modelo.
+        *   Ajuda a identificar pontos de dados influentes ou outliers.
+        *   Útil para comparação de modelos (modelos com ELPD_LOO maior são preferíveis).
+        
+        **Desafios:**
+        *   Computacionalmente intensivo, pois requer rodar a inferência $N$ vezes (onde $N$ é o número de dados).
+        *   Métodos eficientes como PSIS-LOO (Pareto Smoothed Importance Sampling) são usados na prática
+            (implementados em bibliotecas como ArviZ) para evitar o re-treinamento completo.
+        
+        **Interpretação:**
+        *   Um ELPD_LOO mais alto indica um modelo com melhor poder preditivo.
+        *   Valores de "k-hat" (diagnóstico de PSIS-LOO) acima de 0.7 podem indicar pontos de dados
+            problemáticos ou um modelo mal-especificado.
         """)
 
-        # Trace Plot
-        fig1, ax1 = plt.subplots(figsize=(10, 4))
-        ax1.plot(samples)
-        ax1.set_xlabel("Iteração")
-        ax1.set_ylabel("Valor do Parâmetro")
-        ax1.set_title("Trace Plot da Cadeia MCMC")
-        ax1.grid(True)
-        st.pyplot(fig1)
-        plt.close(fig1)
-
-        # Histograma da Posterior
-        fig2, ax2 = plt.subplots(figsize=(10, 4))
-        sns.histplot(samples[int(num_iterations*0.2):], kde=True, ax=ax2, color='skyblue') # Discard burn-in
-        ax2.axvline(x=true_value, color='red', linestyle='--', label="Valor 'Verdadeiro' Simulado")
-        ax2.set_xlabel("Valor do Parâmetro")
-        ax2.set_ylabel("Frequência")
-        ax2.set_title("Distribuição Posterior Amostrada (após Burn-in)")
-        ax2.legend()
-        st.pyplot(fig2)
-        plt.close(fig2)
-
-def module5_sensitivity_validation():
-    st.header("Módulo 5: Análise de Sensibilidade e Validação")
-    st.markdown("""
-    Este módulo explora como avaliar a identificabilidade dos parâmetros, o impacto das correlações e a validação do modelo.
-    """)
-
-    st.subheader("Simulação de Amostras Posteriores")
-    num_samples = st.slider("Número de Amostras Posteriores", 1000, 10000, 5000, 1000)
-    prior_mean_C11 = st.slider("Média do Prior C₁₁", 100, 200, 140, 5)
-    prior_std_C11 = st.slider("Desvio Padrão do Prior C₁₁", 10, 50, 30, 5)
-    true_value_C11 = st.slider("Valor 'Verdadeiro' Simulado C₁₁", 100, 200, 138, 5)
-    likelihood_std_C11 = st.slider("Desvio Padrão da Likelihood C₁₁", 1, 10, 3, 1)
-    
-    correlation_strength = st.slider("Força da Correlação C₁₁-C₁₂", -0.99, 0.99, -0.7, 0.05)
-
-    if st.button("Analisar Sensibilidade e Correlação"):
-        C11_post_samples, C12_post_samples, C11_prior_samples, C12_prior_samples = \
-            simulate_posterior_samples(num_samples, prior_mean_C11, prior_std_C11, 
-                                       true_value_C11, likelihood_std_C11, correlation_strength)
-        
-        st.markdown("---")
-        st.subheader("1. Identificabilidade (Comparação Prior vs. Posterior)")
-        
-        col_id1, col_id2 = st.columns(2)
-        with col_id1:
-            st.write(f"**C₁₁:**")
-            st.write(f"SD Prior: {np.std(C11_prior_samples):.2f}")
-            st.write(f"SD Posterior: {np.std(C11_post_samples):.2f}")
-            sd_ratio_C11 = np.std(C11_prior_samples) / np.std(C11_post_samples)
-            st.write(f"Razão SD (Prior/Posterior): {sd_ratio_C11:.2f}")
-            st.markdown(f"**Interpretação C₁₁:** {'Bem identificável' if sd_ratio_C11 > 5 else ('Moderadamente identificável' if sd_ratio_C11 > 2 else 'Mal identificável')}")
-        
-        with col_id2:
-            st.write(f"**C₁₂:**")
-            st.write(f"SD Prior: {np.std(C12_prior_samples):.2f}")
-            st.write(f"SD Posterior: {np.std(C12_post_samples):.2f}")
-            sd_ratio_C12 = np.std(C12_prior_samples) / np.std(C12_post_samples)
-            st.write(f"Razão SD (Prior/Posterior): {sd_ratio_C12:.2f}")
-            st.markdown(f"**Interpretação C₁₂:** {'Bem identificável' if sd_ratio_C12 > 5 else ('Moderadamente identificável' if sd_ratio_C12 > 2 else 'Mal identificável')}")
-
-        fig_id, ax_id = plt.subplots(1, 2, figsize=(12, 4))
-        sns.histplot(C11_prior_samples, kde=True, color='blue', label='Prior C₁₁', ax=ax_id[0], stat='density', alpha=0.5)
-        sns.histplot(C11_post_samples, kde=True, color='red', label='Posterior C₁₁', ax=ax_id[0], stat='density', alpha=0.7)
-        ax_id[0].set_title("Prior vs. Posterior para C₁₁")
-        ax_id[0].legend()
-
-        sns.histplot(C12_prior_samples, kde=True, color='blue', label='Prior C₁₂', ax=ax_id[1], stat='density', alpha=0.5)
-        sns.histplot(C12_post_samples, kde=True, color='red', label='Posterior C₁₂', ax=ax_id[1], stat='density', alpha=0.7)
-        ax_id[1].set_title("Prior vs. Posterior para C₁₂")
-        ax_id[1].legend()
-        st.pyplot(fig_id)
-        plt.close(fig_id)
-
-        st.markdown("---")
-        st.subheader("2. Impacto da Correlação Extrema")
-        
-        # Calculate correlation
-        correlation_matrix = np.corrcoef(C11_post_samples, C12_post_samples)
-        st.write(f"**Correlação Posterior (C₁₁, C₁₂):** {correlation_matrix[0, 1]:.2f}")
-        
-        fig_corr, ax_corr = plt.subplots(figsize=(8, 6))
-        sns.scatterplot(x=C11_post_samples, y=C12_post_samples, ax=ax_corr, alpha=0.3)
-        ax_corr.set_xlabel("C₁₁")
-        ax_corr.set_ylabel("C₁₂")
-        ax_corr.set_title("Scatter Plot das Amostras Posteriores (C₁₁ vs C₁₂)")
-        st.pyplot(fig_corr)
-        plt.close(fig_corr)
-        
-        st.markdown(f"""
-        Uma correlação de **{correlation_matrix[0, 1]:.2f}** entre C₁₁ e C₁₂ indica uma forte dependência.
-        - **Impacto nas Marginais:** As distribuições marginais (histogramas individuais) podem parecer razoáveis, mas não capturam o "trade-off" entre os parâmetros.
-        - **Impacto nos Intervalos Conjuntos:** A região de credibilidade conjunta (visível no scatter plot) é alongada e estreita. Isso significa que, embora individualmente C₁₁ e C₁₂ possam ter uma certa faixa de valores, apenas combinações específicas ao longo da linha de correlação são plausíveis. Ignorar essa correlação pode levar a conclusões enganosas sobre a variabilidade real dos parâmetros.
-        """)
-
-        st.markdown("---")
-        st.subheader("3. Posterior Predictive Check (PPC)")
-        st.markdown("""
-        O PPC verifica se o modelo é capaz de gerar dados semelhantes aos observados.
-        Aqui, simulamos dados preditivos e os comparamos com um valor "observado" simulado.
-        """)
-        
-        # Simulate observed data for PPC
-        sim_observed_v = np.random.normal(true_value_C11, likelihood_std_C11)
-        
-        # Simulate predictive data from posterior samples
-        sim_predictive_v = np.random.normal(C11_post_samples, likelihood_std_C11)
-        
-        fig_ppc, ax_ppc = plt.subplots(figsize=(10, 6))
-        sns.histplot(sim_predictive_v, kde=True, color='green', label='Dados Preditivos', ax=ax_ppc, stat='density', alpha=0.7)
-        ax_ppc.axvline(x=sim_observed_v, color='red', linestyle='--', label='Dado Observado Simulado')
-        ax_ppc.set_xlabel("Velocidade (m/s)")
-        ax_ppc.set_ylabel("Densidade")
-        ax_ppc.set_title("Posterior Predictive Check (PPC) para C₁₁")
-        ax_ppc.legend()
-        st.pyplot(fig_ppc)
-        plt.close(fig_ppc)
-        
-        # Calculate p-value for PPC (conceptual)
-        p_value_ppc = np.mean(sim_predictive_v > sim_observed_v)
-        st.markdown(f"""
-        - O **Dado Observado Simulado** é o valor que o modelo tenta explicar.
-        - Os **Dados Preditivos** são gerados usando os parâmetros amostrados da posterior.
-        - Se o dado observado cair dentro da distribuição dos dados preditivos (especialmente perto do centro), o modelo é considerado **adequado**.
-        - Um p-valor preditivo de **{p_value_ppc:.2f}** (proporção de dados preditivos maiores que o observado) indica que o modelo é {'adequado' if 0.05 < p_value_ppc < 0.95 else 'potencialmente inadequado'}.
-        """)
-
-
-# --- Main App Navigation ---
+#--- Interface Streamlit ---
 st.sidebar.title("Navegação")
-selected_module = st.sidebar.radio(
-    "Escolha um Módulo",
-    [
-        "Módulo 1: Fundamentos",
-        "Módulo 2: Medição Ultrassônica",
-        "Módulo 3: Inferência Bayesiana",
-        "Módulo 4: Algoritmos MCMC",
-        "Módulo 5: Sensibilidade e Validação"
-    ]
-)
+page = st.sidebar.radio("Selecione um Módulo", [
+    "Módulo 1: Christoffel Solver",
+    "Módulo 2: Modelo Ultrassônico",
+    "Módulo 3: Likelihood Bayesiana",
+    "Módulo 4: MCMC Metropolis-Hastings",
+    "Módulo 5: Validação Completa"
+])
 
-if selected_module == "Módulo 1: Fundamentos":
-    module1_fundamentals()
-elif selected_module == "Módulo 2: Medição Ultrassônica":
-    module2_ultrasound_measurement()
-elif selected_module == "Módulo 3: Inferência Bayesiana":
-    module3_bayesian_inference()
-elif selected_module == "Módulo 4: Algoritmos MCMC":
-    module4_mcmc_algorithms()
-elif selected_module == "Módulo 5: Sensibilidade e Validação":
-    module5_sensitivity_validation()
+# Inicializar solvers e modelos (singleton pattern para evitar recriação)
+if 'christoffel_solver' not in st.session_state:
+    st.session_state.christoffel_solver = ChristoffelSolver()
+if 'ultrasonic_model' not in st.session_state:
+    st.session_state.ultrasonic_model = UltrasonicModel(st.session_state.christoffel_solver)
+if 'bayesian_likelihood' not in st.session_state:
+    st.session_state.bayesian_likelihood = BayesianLikelihood(st.session_state.ultrasonic_model)
+if 'mcmc_sampler' not in st.session_state:
+    st.session_state.mcmc_sampler = MCMCSampler(st.session_state.bayesian_likelihood)
+if 'validation_tools' not in st.session_state:
+    st.session_state.validation_tools = ValidationTools(st.session_state.bayesian_likelihood)
+
+# --- Módulo 1: Christoffel Solver ---
+if page == "Módulo 1: Christoffel Solver":
+    st.title("Módulo 1: Christoffel Solver Exato")
+    st.write("""
+    Este módulo implementa o solver exato da equação de Christoffel para materiais anisotrópicos.
+    Ele calcula as velocidades de fase e os vetores de polarização para uma dada direção de propagação
+    e propriedades elásticas do material.
+    """)
+    st.subheader("Propriedades do Material (Carbono-Epóxi Padrão)")
+    
+    # Usar st.session_state para persistir os parâmetros C
+    if 'c_params_gpa' not in st.session_state:
+        st.session_state.c_params_gpa = DEFAULT_C_PARAMS_GPA.copy()
+    if 'rho_kg_m3' not in st.session_state:
+        st.session_state.rho_kg_m3 = DEFAULT_RHO_KG_M3
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("##### Rigidez Axial (GPa)")
+        st.session_state.c_params_gpa['C11'] = st.number_input("C11 (GPa)", value=st.session_state.c_params_gpa['C11'], min_value=1.0, max_value=300.0, step=1.0)
+        st.session_state.c_params_gpa['C22'] = st.number_input("C22 (GPa)", value=st.session_state.c_params_gpa['C22'], min_value=1.0, max_value=300.0, step=1.0)
+        st.session_state.c_params_gpa['C33'] = st.number_input("C33 (GPa)", value=st.session_state.c_params_gpa['C33'], min_value=1.0, max_value=300.0, step=1.0)
+    with col2:
+        st.markdown("##### Acoplamento (GPa)")
+        st.session_state.c_params_gpa['C12'] = st.number_input("C12 (GPa)", value=st.session_state.c_params_gpa['C12'], min_value=0.0, max_value=100.0, step=0.1)
+        st.session_state.c_params_gpa['C13'] = st.number_input("C13 (GPa)", value=st.session_state.c_params_gpa['C13'], min_value=0.0, max_value=100.0, step=0.1)
+        st.session_state.c_params_gpa['C23'] = st.number_input("C23 (GPa)", value=st.session_state.c_params_gpa['C23'], min_value=0.0, max_value=100.0, step=0.1)
+    with col3:
+        st.markdown("##### Cisalhamento (GPa)")
+        st.session_state.c_params_gpa['C44'] = st.number_input("C44 (GPa)", value=st.session_state.c_params_gpa['C44'], min_value=0.1, max_value=100.0, step=0.1)
+        st.session_state.c_params_gpa['C55'] = st.number_input("C55 (GPa)", value=st.session_state.c_params_gpa['C55'], min_value=0.1, max_value=100.0, step=0.1)
+        st.session_state.c_params_gpa['C66'] = st.number_input("C66 (GPa)", value=st.session_state.c_params_gpa['C66'], min_value=0.1, max_value=100.0, step=0.1)
+        st.session_state.rho_kg_m3 = st.number_input("Densidade ρ (kg/m³)", value=st.session_state.rho_kg_m3, min_value=500.0, max_value=3000.0, step=1.0)
+
+    st.subheader("Direção de Propagação")
+    theta_deg = st.slider("Ângulo Polar θ (graus, do eixo Z)", 0, 180, 0)
+    phi_deg = st.slider("Ângulo Azimutal φ (graus, no plano XY)", 0, 360, 0)
+
+    theta_rad = np.deg2rad(theta_deg)
+    phi_rad = np.deg2rad(phi_deg)
+    n = np.array([
+        np.sin(theta_rad) * np.cos(phi_rad),
+        np.sin(theta_rad) * np.sin(phi_rad),
+        np.cos(theta_rad)
+    ])
+    st.write(f"Vetor de direção n: [{n[0]:.3f}, {n[1]:.3f}, {n[2]:.3f}]")
+
+    if st.button("Calcular Velocidades"):
+        C_voigt_pa = get_orthotropic_C_voigt(st.session_state.c_params_gpa)
+        try:
+            velocities, eigenvectors, modes = st.session_state.christoffel_solver.solve(C_voigt_pa, st.session_state.rho_kg_m3, n)
+            st.success("Cálculo Concluído!")
+            
+            st.subheader("Resultados")
+            for i in range(3):
+                st.write(f"**Modo {modes[i]}**")
+                st.write(f"  Velocidade de Fase: {velocities[i]:.2f} m/s")
+                st.write(f"  Vetor de Polarização: [{eigenvectors[0, i]:.3f}, {eigenvectors[1, i]:.3f}, {eigenvectors[2, i]:.3f}]")
+            
+            st.markdown("---")
+            st.subheader("Matriz de Rigidez (Voigt, GPa)")
+            st.dataframe(pd.DataFrame(C_voigt_pa / 1e9, columns=[f'C{i+1}' for i in range(6)], index=[f'C{i+1}' for i in range(6)]))
+            st.subheader("Matriz de Christoffel (Γ)")
+            Gamma = st.session_state.christoffel_solver._get_christoffel_matrix(C_voigt_pa, n)
+            st.dataframe(pd.DataFrame(Gamma))
+
+        except ValueError as e:
+            st.error(f"Erro no cálculo: {e}")
+        except Exception as e:
+            st.error(f"Ocorreu um erro inesperado: {e}")
+
+#--- Módulo 2: Modelo Ultrassônico Realista ---
+elif page == "Módulo 2: Modelo Ultrassônico":
+    st.title("Módulo 2: Modelo Ultrassônico Realista")
+    st.write("""
+    Este módulo simula o comportamento de um sinal ultrassônico através de um material compósito,
+    considerando o Tempo de Voo (TOF), atenuação e ruído.
+    """)
+    st.subheader("Parâmetros do Ensaio Ultrassônico")
+    col1, col2 = st.columns(2)
+    with col1:
+        thickness_mm = st.number_input("Espessura da Amostra (mm)", value=5.0, min_value=0.1, max_value=50.0, step=0.1)
+        frequency_mhz = st.number_input("Frequência do Transdutor (MHz)", value=5.0, min_value=0.1, max_value=20.0, step=0.1)
+        mode_selection = st.selectbox("Modo de Onda", ["qP (Quasi-Longitudinal)", "qS1 (Quasi-Cisalhante 1)", "qS2 (Quasi-Cisalhante 2)"])
+        mode_idx = {"qP (Quasi-Longitudinal)": 0, "qS1 (Quasi-Cisalhante 1)": 1, "qS2 (Quasi-Cisalhante 2)": 2}[mode_selection]
+    with col2:
+        noise_level = st.slider("Nível de Ruído (0-1)", value=0.05, min_value=0.0, max_value=1.0, step=0.01)
+        loss_factor_base = st.number_input("Fator de Perda Base", value=0.01, min_value=0.001, max_value=0.1, step=0.001, format="%.3f")
+        loss_factor_freq_exp = st.number_input("Expoente da Frequência para Perda", value=1.0, min_value=0.0, max_value=2.0, step=0.1)
+    
+    st.subheader("Direção de Propagação")
+    theta_deg_ult = st.slider("Ângulo Polar θ (graus)", 0, 180, 0, key="theta_ult")
+    phi_deg_ult = st.slider("Ângulo Azimutal φ (graus)", 0, 360, 0, key="phi_ult")
+
+    theta_rad_ult = np.deg2rad(theta_deg_ult)
+    phi_rad_ult = np.deg2rad(phi_deg_ult)
+    n_ult = np.array([
+        np.sin(theta_rad_ult) * np.cos(phi_rad_ult),
+        np.sin(theta_rad_ult) * np.sin(phi_rad_ult),
+        np.cos(theta_rad_ult)
+    ])
+
+    if st.button("Simular Sinal Ultrassônico"):
+        C_voigt_pa = get_orthotropic_C_voigt(st.session_state.c_params_gpa)
+        rho = st.session_state.rho_kg_m3
+        thickness_m = thickness_mm / 1000.0
+        frequency_hz = frequency_mhz * 1e6
+
+        try:
+            velocities, _, _ = st.session_state.christoffel_solver.solve(C_voigt_pa, rho, n_ult)
+            phase_velocity = velocities[mode_idx]
+            
+            tof = st.session_state.ultrasonic_model.predict_tof(C_voigt_pa, rho, thickness_m, n_ult, mode_idx)
+            attenuation_db = st.session_state.ultrasonic_model.predict_attenuation(C_voigt_pa, rho, n_ult, frequency_hz, 
+thickness_m, mode_idx, loss_factor_base,
+loss_factor_freq_exp)
+            st.subheader("Resultados da Simulação")
+            st.write(f"Velocidade de Fase ({mode_selection}): {phase_velocity:.2f} m/s")
+            st.write(f"Tempo de Voo (TOF): {tof * 1e6:.2f} µs")
+            st.write(f"Atenuação: {attenuation_db:.2f} dB")
+
+            time_axis, signal = st.session_state.ultrasonic_model.simulate_signal(
+                C_voigt_pa, rho, thickness_m, n_ult, frequency_hz, mode_idx, 
+                noise_level, loss_factor_base, loss_factor_freq_exp
+            )
+
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(time_axis * 1e6, signal)
+            ax.set_title("Sinal Ultrassônico Simulado")
+            ax.set_xlabel("Tempo (µs)")
+            ax.set_ylabel("Amplitude")
+            ax.grid(True)
+            st.pyplot(fig)
+
+        except ValueError as e:
+            st.error(f"Erro no cálculo: {e}")
+        except Exception as e:
+            st.error(f"Ocorreu um erro inesperado: {e}")
+
+#--- Módulo 3: Likelihood Bayesiana Precisa ---
+elif page == "Módulo 3: Likelihood Bayesiana":
+    st.title("Módulo 3: Likelihood Bayesiana Precisa")
+    st.write("""
+    Este módulo calcula o log da verossimilhança (likelihood) e do prior para um conjunto de parâmetros
+    (constantes elásticas e densidade) dado um conjunto de dados experimentais de velocidade.
+    """)
+    st.subheader("Dados Experimentais (Velocidades)")
+    st.write("Insira dados de velocidade experimental (m/s), desvio padrão (m/s), direção (θ, φ) e espessura (mm).")
+
+    # Estrutura para dados experimentais
+    if 'experimental_data' not in st.session_state:
+        st.session_state.experimental_data = pd.DataFrame({
+            'direction_n': [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.707, 0.0, 0.707]],
+            'mode_idx': [0, 0, 0, 0], # qP
+            'v_exp': [7400.0, 2100.0, 2000.0, 4500.0],
+            'sigma_exp': [50.0, 50.0, 50.0, 70.0],
+            'thickness_m': [5.0/1000, 5.0/1000, 5.0/1000, 5.0/1000]
+        })
+    
+    edited_df = st.data_editor(st.session_state.experimental_data, num_rows="dynamic", key="exp_data_editor")
+    st.session_state.experimental_data = edited_df
+
+    st.subheader("Priors (Limites Uniformes para C_ij em GPa, ρ em kg/m³)")
+    if 'prior_bounds_gpa' not in st.session_state:
+        st.session_state.prior_bounds_gpa = {
+            'C11': [100.0, 180.0], 'C22': [5.0, 15.0], 'C33': [5.0, 15.0],
+            'C12': [2.0, 8.0], 'C13': [2.0, 8.0], 'C23': [2.0, 8.0],
+            'C44': [1.0, 5.0], 'C55': [3.0, 10.0], 'C66': [3.0, 10.0]
+        }
+    if 'rho_prior_bounds' not in st.session_state:
+        st.session_state.rho_prior_bounds = [1400.0, 1700.0]
+
+    col_p1, col_p2, col_p3 = st.columns(3)
+    with col_p1:
+        st.markdown("##### Rigidez Axial")
+        for p in ['C11', 'C22', 'C33']:
+            st.session_state.prior_bounds_gpa[p] = st.slider(f"{p} (GPa)", 0.0, 300.0, st.session_state.prior_bounds_gpa[p], key=f"prior_{p}")
+    with col_p2:
+        st.markdown("##### Acoplamento")
+        for p in ['C12', 'C13', 'C23']:
+            st.session_state.prior_bounds_gpa[p] = st.slider(f"{p} (GPa)", 0.0, 100.0, st.session_state.prior_bounds_gpa[p], key=f"prior_{p}")
+    with col_p3:
+        st.markdown("##### Cisalhamento")
+        for p in ['C44', 'C55', 'C66']:
+            st.session_state.prior_bounds_gpa[p] = st.slider(f"{p} (GPa)", 0.0, 100.0, st.session_state.prior_bounds_gpa[p], key=f"prior_{p}")
+        st.session_state.rho_prior_bounds = st.slider("Densidade ρ (kg/m³)", 500.0, 3000.0, st.session_state.rho_prior_bounds, key="prior_rho")
+
+    st.subheader("Avaliar Log-Likelihood/Posterior para Parâmetros Atuais")
+    if st.button("Calcular Log-Likelihood e Log-Posterior"):
+        try:
+            ll = st.session_state.bayesian_likelihood.log_likelihood(
+                st.session_state.c_params_gpa, st.session_state.rho_kg_m3, st.session_state.experimental_data
+            )
+            lp = st.session_state.bayesian_likelihood.log_prior(
+                st.session_state.c_params_gpa, st.session_state.rho_kg_m3, st.session_state.prior_bounds_gpa, st.session_state.rho_prior_bounds
+            )
+            lpost = st.session_state.bayesian_likelihood.log_posterior(
+                st.session_state.c_params_gpa, st.session_state.rho_kg_m3, st.session_state.experimental_data, 
+                st.session_state.prior_bounds_gpa, st.session_state.rho_prior_bounds
+            )
+            st.success("Cálculo Concluído!")
+            st.write(f"Log-Likelihood: {ll:.2f}")
+            st.write(f"Log-Prior: {lp:.2f}")
+            st.write(f"Log-Posterior: {lpost:.2f}")
+        except Exception as e:
+            st.error(f"Erro no cálculo: {e}")
+
+#--- Módulo 4: MCMC Metropolis-Hastings ---
+elif page == "Módulo 4: MCMC Metropolis-Hastings":
+    st.title("Módulo 4: MCMC Metropolis-Hastings")
+    st.write("""
+    Este módulo implementa o algoritmo Metropolis-Hastings para amostrar a distribuição posterior
+    dos parâmetros do material. Inclui adaptação da covariância da proposta e diagnósticos de convergência.
+    """)
+    st.subheader("Configurações MCMC")
+    col_mcmc1, col_mcmc2 = st.columns(2)
+    with col_mcmc1:
+        n_iter = st.number_input("Número de Iterações por Cadeia", value=MCMC_DEFAULTS['n_iter'], min_value=1000, max_value=100000, step=1000)
+        burn_in = st.number_input("Iterações de Burn-in", value=MCMC_DEFAULTS['burn_in'], min_value=100, max_value=n_iter // 2, step=100)
+    with col_mcmc2:
+        n_chains = st.number_input("Número de Cadeias", value=MCMC_DEFAULTS['n_chains'], min_value=1, max_value=4, step=1)
+        proposal_scale = st.number_input("Escala Inicial da Proposta", value=MCMC_DEFAULTS['proposal_scale'], min_value=0.001, max_value=1.0, step=0.01)
+
+    # --- CORREÇÃO: Inicializar rho_prior_bounds se não existir ---
+    if 'rho_prior_bounds' not in st.session_state:
+        st.session_state.rho_prior_bounds = [1400.0, 1700.0]
+
+    if st.button("Rodar MCMC"):
+        if 'experimental_data' not in st.session_state or st.session_state.experimental_data.empty:
+            st.error("Por favor, insira dados experimentais no Módulo 3 primeiro.")
+        else:
+            with st.spinner("Rodando MCMC... Isso pode levar alguns minutos para muitas iterações."):
+                # Preparar estados iniciais
+                param_names = list(st.session_state.prior_bounds_gpa.keys())
+                n_params_c = len(param_names)
+                n_total_params = n_params_c + 1 # C_params + rho
+                
+                initial_states = []
+                for _ in range(n_chains):
+                    initial_c_params = {name: uniform.rvs(loc=st.session_state.prior_bounds_gpa[name][0], 
+                        scale=st.session_state.prior_bounds_gpa[name][1] - st.session_state.prior_bounds_gpa[name][0])
+                        for name in param_names}
+                    initial_rho = uniform.rvs(loc=st.session_state.rho_prior_bounds[0],
+                        scale=st.session_state.rho_prior_bounds[1] - st.session_state.rho_prior_bounds[0])
+                    initial_state_vector = np.concatenate((get_param_vector_from_dict(initial_c_params), [initial_rho]))
+                    initial_states.append(initial_state_vector)
+                all_samples, all_log_posteriors, all_acceptance_rates = st.session_state.mcmc_sampler.sample(
+                    initial_states, n_iter, burn_in, proposal_scale, 
+                    st.session_state.experimental_data, st.session_state.prior_bounds_gpa, st.session_state.rho_prior_bounds
+                )
+                st.session_state.mcmc_results = {
+                    'all_samples': all_samples,
+                    'all_log_posteriors': all_log_posteriors,
+                    'all_acceptance_rates': all_acceptance_rates,
+                    'burn_in': burn_in,
+                    'param_names': param_names + ['rho']
+                }
+                st.success("MCMC Concluído!")
+
+        if 'mcmc_results' in st.session_state:
+            results = st.session_state.mcmc_results
+            all_samples = results['all_samples']
+            all_log_posteriors = results['all_log_posteriors']
+            all_acceptance_rates = results['all_acceptance_rates']
+            burn_in = results['burn_in']
+            param_names = results['param_names']
+
+            st.subheader("Diagnósticos MCMC")
+            
+            # R-hat
+            rhat_values = st.session_state.mcmc_sampler.calculate_rhat(all_samples, burn_in)
+            if rhat_values is not None:
+                st.write("##### R-hat (Gelman-Rubin)")
+                rhat_df = pd.DataFrame({'Parâmetro': param_names, 'R-hat': rhat_values})
+                st.dataframe(rhat_df)
+                if np.any(rhat_values > 1.1):
+                    st.warning("R-hat > 1.1 para alguns parâmetros, indicando possível falta de convergência. Considere mais iterações ou ajuste a escala da proposta.")
+                else:
+                    st.success("R-hat < 1.1 para todos os parâmetros, indicando boa convergência entre cadeias.")
+            
+            # ESS
+            ess_values = st.session_state.mcmc_sampler.calculate_ess(all_samples, burn_in)
+            if ess_values is not None:
+                st.write("##### Effective Sample Size (ESS)")
+                ess_df = pd.DataFrame({'Parâmetro': param_names, 'ESS': ess_values})
+                st.dataframe(ess_df)
+                if np.any(ess_values < 400):
+                    st.warning("ESS < 400 para alguns parâmetros, indicando alta autocorrelação. Considere mais iterações ou um burn-in maior.")
+                else:
+                    st.success("ESS > 400 para a maioria dos parâmetros, indicando amostras efetivas suficientes.")
+
+            st.write("##### Taxas de Aceitação")
+            for i, rate in enumerate(all_acceptance_rates):
+                st.write(f"Cadeia {i+1}: {rate:.2%}")
+            
+            st.subheader("Trace Plots e Histograma Marginal")
+            
+            # Plotar trace plots e histogramas para os primeiros 4 parâmetros (para não sobrecarregar)
+            num_plots = min(len(param_names), 4)
+            for p_idx in range(num_plots):
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                
+                # Trace Plot
+                for chain_idx in range(len(all_samples)):
+                    axes[0].plot(all_samples[chain_idx][:, p_idx], alpha=0.7, label=f'Cadeia {chain_idx+1}')
+                axes[0].axvline(burn_in, color='red', linestyle='--', label='Burn-in')
+                axes[0].set_title(f"Trace Plot para {param_names[p_idx]}")
+                axes[0].set_xlabel("Iteração")
+                axes[0].set_ylabel(param_names[p_idx])
+                axes[0].legend()
+                
+                # Histograma Marginal
+                combined_samples = np.concatenate([s[burn_in:, p_idx] for s in all_samples])
+                sns.histplot(combined_samples, kde=True, ax=axes[1], color=COLORS[p_idx % len(COLORS)])
+                axes[1].set_title(f"Histograma Marginal para {param_names[p_idx]}")
+                axes[1].set_xlabel(param_names[p_idx])
+                axes[1].set_ylabel("Frequência")
+                
+                st.pyplot(fig)
+            
+            st.subheader("Estimativas Posteriores")
+            combined_samples_all_params = np.concatenate([s[burn_in:, :] for s in all_samples], axis=0)
+            posterior_means = np.mean(combined_samples_all_params, axis=0)
+            posterior_stds = np.std(combined_samples_all_params, axis=0)
+            
+            posterior_df = pd.DataFrame({
+                'Parâmetro': param_names,
+                'Média Posterior': posterior_means,
+                'SD Posterior': posterior_stds
+            })
+            st.dataframe(posterior_df)
+
+#--- Módulo 5: Validação Completa ---
+elif page == "Módulo 5: Validação Completa":
+    st.title("Módulo 5: Validação Completa")
+    st.write("""
+    Este módulo fornece ferramentas para análise de sensibilidade, identificabilidade e validação
+    do modelo Bayesiano, utilizando os resultados do MCMC.
+    """)
+    if 'mcmc_results' not in st.session_state:
+        st.warning("Por favor, rode o MCMC no Módulo 4 primeiro para gerar amostras posteriores.")
+    else:
+        results = st.session_state.mcmc_results
+        all_samples = results['all_samples']
+        burn_in = results['burn_in']
+        param_names = results['param_names']
+        
+        combined_samples_all_params = np.concatenate([s[burn_in:, :] for s in all_samples], axis=0)
+
+        st.subheader("1. Análise de Sensibilidade ao Prior")
+        st.write("""
+        Compara a dispersão (desvio padrão) da distribuição posterior com a dispersão do prior.
+        Uma razão (SD Prior / SD Posterior) significativamente maior que 1 indica que os dados
+        foram informativos para aquele parâmetro.
+        """)
+        sensitivity_df = st.session_state.validation_tools.sensitivity_to_prior(
+            combined_samples_all_params, st.session_state.prior_bounds_gpa, st.session_state.rho_prior_bounds
+        )
+        st.dataframe(sensitivity_df)
+        st.markdown("""
+        *   **Razão > 5:** Parâmetro bem-identificado (dados muito informativos).
+        *   **Razão 2-5:** Parâmetro moderadamente identificado.
+        *   **Razão < 2:** Parâmetro mal-identificado (dados pouco informativos, posterior próxima ao prior).
+        """)
+
+        st.subheader("2. Análise de Identificabilidade (Correlação Posterior)")
+        st.write("""
+        A matriz de correlação posterior revela dependências entre os parâmetros.
+        Valores absolutos próximos de 1 indicam alta correlação, o que pode sugerir
+        que os parâmetros não são bem-identificáveis independentemente pelos dados.
+        """)
+        correlation_matrix = st.session_state.validation_tools.identifiability_analysis(combined_samples_all_params)
+        correlation_df = pd.DataFrame(correlation_matrix, columns=param_names, index=param_names)
+        
+        fig_corr, ax_corr = plt.subplots(figsize=(10, 8))
+        sns.heatmap(correlation_df, annot=True, cmap='coolwarm', fmt=".2f", ax=ax_corr)
+        ax_corr.set_title("Matriz de Correlação Posterior")
+        st.pyplot(fig_corr)
+        st.markdown("""
+        *   **Correlação |ρ| > 0.9:** Alta correlação, pode indicar problemas de identificabilidade.
+        *   **Correlação |ρ| < 0.5:** Baixa correlação, parâmetros mais independentes.
+        """)
+
+        st.subheader("3. Posterior Predictive Check (PPC)")
+        st.write("""
+        O PPC simula dados com base nas amostras posteriores do modelo e os compara com os dados experimentais observados.
+        Se o modelo for adequado, os dados observados devem ser consistentes com os dados simulados.
+        """)
+        
+        ppc_results_df, p_value_bayesian = st.session_state.validation_tools.posterior_predictive_check(
+            combined_samples_all_params, st.session_state.experimental_data
+        )
+        st.dataframe(ppc_results_df)
+        st.write(f"**P-valor Bayesiano (baseado em estatística chi-quadrado): {p_value_bayesian:.2f}**")
+        st.markdown("""
+        *   **P-valor Bayesiano ≈ 0.5:** O modelo prediz os dados observados de forma consistente.
+        *   **P-valor Bayesiano < 0.05 ou > 0.95:** O modelo pode ser inadequado para descrever os dados.
+        """)
+
+        fig_ppc, ax_ppc = plt.subplots(figsize=(10, 6))
+        ax_ppc.errorbar(ppc_results_df.index, ppc_results_df['v_exp'], yerr=ppc_results_df['sigma_exp'], 
+                        fmt='o', label='Experimental', color='red', capsize=5)
+        ax_ppc.errorbar(ppc_results_df.index, ppc_results_df['v_pred_mean'], yerr=ppc_results_df['v_pred_std'], 
+                        fmt='x', label='Predito (Média ± SD)', color='blue', capsize=5)
+        ax_ppc.set_title("Posterior Predictive Check: Velocidades")
+        ax_ppc.set_xlabel("Ponto de Medição")
+        ax_ppc.set_ylabel("Velocidade (m/s)")
+        ax_ppc.legend()
+        ax_ppc.grid(True)
+        st.pyplot(fig_ppc)
+
+        st.subheader("4. Leave-One-Out Cross-Validation (LOO-CV) - Conceitual")
+        st.session_state.validation_tools.loo_cv_conceptual()
