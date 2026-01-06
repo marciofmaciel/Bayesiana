@@ -1189,12 +1189,13 @@ if page == "Módulo 6: Módulos Elásticos":
         )
 
 # --- Atualizar menu lateral ---
-st.sidebar.title("Navegação")
-page = st.sidebar.radio("Selecione um Módulo", [
-    "Módulo 1: Christoffel Solver",
-    "Módulo 2: Modelo Ultrassônico",
-    "Módulo 3: Likelihood Bayesiana",
-    "Módulo 4: MCMC Metropolis-Hastings",
-    "Módulo 5: Validação Completa",
-    "Módulo 6: Módulos Elásticos"
-])
+# REMOVA este bloco duplicado do final do arquivo!
+# st.sidebar.title("Navegação")
+# page = st.sidebar.radio("Selecione um Módulo", [
+#     "Módulo 1: Christoffel Solver",
+#     "Módulo 2: Modelo Ultrassônico",
+#     "Módulo 3: Likelihood Bayesiana",
+#     "Módulo 4: MCMC Metropolis-Hastings",
+#     "Módulo 5: Validação Completa",
+#     "Módulo 6: Módulos Elásticos"
+# ])
