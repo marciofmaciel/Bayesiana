@@ -1,0 +1,15 @@
+// This file tells VS Code to use the custom PowerShell profile for this workspace
+{
+    "terminal.integrated.profiles.windows": {
+        "PowerShell": {
+            "source": "PowerShell",
+            "icon": "terminal-powershell",
+            "args": [
+                "-NoExit",
+                "-Command",
+                ".vscode/profile.ps1"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "PowerShell"
+}
