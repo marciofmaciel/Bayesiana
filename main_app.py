@@ -8,6 +8,8 @@ from scipy.stats import norm, uniform, multivariate_normal
 import time
 import multiprocessing as mp
 from functools import partial
+import io
+from fpdf import FPDF  # Adicione esta linha no topo do arquivo (instale com: pip install fpdf)
 # --- 0. Configurações e Constantes Globais ---
 st.set_page_config(layout="wide", page_title="Inferência Bayesiana para Compósitos via Ultrassom")
 # Cores para gráficos
@@ -622,7 +624,8 @@ page = st.sidebar.radio("Selecione um Módulo", [
     "Módulo 2: Modelo Ultrassônico",
     "Módulo 3: Likelihood Bayesiana",
     "Módulo 4: MCMC Metropolis-Hastings",
-    "Módulo 5: Validação Completa"
+    "Módulo 5: Validação Completa",
+    "Módulo 6: Módulos Elásticos"
 ])
 
 # Inicializar solvers e modelos (singleton pattern para evitar recriação)
@@ -1050,3 +1053,148 @@ elif page == "Módulo 5: Validação Completa":
 
         st.subheader("4. Leave-One-Out Cross-Validation (LOO-CV) - Conceitual")
         st.session_state.validation_tools.loo_cv_conceptual()
+
+# --- Novo Módulo: Cálculo dos Módulos Elásticos ---
+def calcular_modulos_elasticos(params_gpa):
+    """
+    Calcula os módulos elásticos principais (E1, E2, E3, G12, G13, G23, nu12, nu13, nu23)
+    para um material ortotrópico a partir dos parâmetros C_ij em GPa.
+    Retorna um dicionário com os valores.
+    """
+    # Parâmetros em GPa
+    C11 = params_gpa['C11']
+    C22 = params_gpa['C22']
+    C33 = params_gpa['C33']
+    C12 = params_gpa['C12']
+    C13 = params_gpa['C13']
+    C23 = params_gpa['C23']
+    C44 = params_gpa['C44']
+    C55 = params_gpa['C55']
+    C66 = params_gpa['C66']
+
+    # Matriz de rigidez (Voigt, 6x6)
+    C = np.array([
+        [C11, C12, C13, 0,   0,   0],
+        [C12, C22, C23, 0,   0,   0],
+        [C13, C23, C33, 0,   0,   0],
+        [0,   0,   0,   C44, 0,   0],
+        [0,   0,   0,   0,   C55, 0],
+        [0,   0,   0,   0,   0,   C66]
+    ])
+    # Matriz de compliância (S = C^-1)
+    S = np.linalg.inv(C)
+
+    # Módulos de Young
+    E1 = 1 / S[0, 0]
+    E2 = 1 / S[1, 1]
+    E3 = 1 / S[2, 2]
+    # Módulos de cisalhamento
+    G12 = 1 / S[5, 5]
+    G13 = 1 / S[4, 4]
+    G23 = 1 / S[3, 3]
+    # Coeficientes de Poisson principais
+    nu12 = -S[0, 1] / S[0, 0]
+    nu13 = -S[0, 2] / S[0, 0]
+    nu21 = -S[1, 0] / S[1, 1]
+    nu23 = -S[1, 2] / S[1, 1]
+    nu31 = -S[2, 0] / S[2, 2]
+    nu32 = -S[2, 1] / S[2, 2]
+
+    return {
+        "E1 (GPa)": E1,
+        "E2 (GPa)": E2,
+        "E3 (GPa)": E3,
+        "G12 (GPa)": G12,
+        "G13 (GPa)": G13,
+        "G23 (GPa)": G23,
+        "nu12": nu12,
+        "nu13": nu13,
+        "nu21": nu21,
+        "nu23": nu23,
+        "nu31": nu31,
+        "nu32": nu32
+    }
+
+# --- Módulo 6: Módulos Elásticos ---
+if page == "Módulo 6: Módulos Elásticos":
+    st.title("Módulo 6: Cálculo dos Módulos Elásticos")
+    st.write("""
+    Este módulo calcula os principais módulos elásticos (E1, E2, E3, G12, G13, G23, Poisson) a partir dos parâmetros C<sub>ij</sub> atuais.
+    """, unsafe_allow_html=True)
+    params_gpa = st.session_state.c_params_gpa
+    modulos = calcular_modulos_elasticos(params_gpa)
+    st.subheader("Resultados dos Módulos Elásticos")
+    modulos_df = pd.DataFrame(modulos, index=["Valor"]).T
+    st.table(modulos_df)
+
+    # --- Escolha do formato do relatório ---
+    formato = st.selectbox(
+        "Formato do relatório para download",
+        options=["TXT", "CSV", "PDF"],
+        index=0
+    )
+
+    # --- Geração do relatório conforme formato escolhido ---
+    if formato == "TXT":
+        relatorio = io.StringIO()
+        relatorio.write("Relatório dos Módulos Elásticos\n")
+        relatorio.write("="*35 + "\n\n")
+        relatorio.write("Parâmetros C_ij utilizados (GPa):\n")
+        for k, v in params_gpa.items():
+            relatorio.write(f"  {k}: {v:.4f}\n")
+        relatorio.write("\nResultados dos módulos elásticos:\n")
+        for k, v in modulos.items():
+            relatorio.write(f"  {k}: {v:.4f}\n")
+        relatorio_str = relatorio.getvalue()
+        st.download_button(
+            label="Baixar Relatório TXT",
+            data=relatorio_str,
+            file_name="modulos_elasticos.txt",
+            mime="text/plain"
+        )
+    elif formato == "CSV":
+        relatorio_csv = io.StringIO()
+        # Parâmetros C_ij
+        pd.DataFrame(params_gpa, index=["C_ij (GPa)"]).to_csv(relatorio_csv)
+        relatorio_csv.write("\n")
+        # Módulos elásticos
+        modulos_df.to_csv(relatorio_csv)
+        st.download_button(
+            label="Baixar Relatório CSV",
+            data=relatorio_csv.getvalue(),
+            file_name="modulos_elasticos.csv",
+            mime="text/csv"
+        )
+    elif formato == "PDF":
+        # Geração do PDF usando fpdf
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        pdf.cell(0, 10, "Relatório dos Módulos Elásticos", ln=True, align="C")
+        pdf.ln(5)
+        pdf.set_font("Arial", size=10)
+        pdf.cell(0, 8, "Parâmetros C_ij utilizados (GPa):", ln=True)
+        for k, v in params_gpa.items():
+            pdf.cell(0, 8, f"  {k}: {v:.4f}", ln=True)
+        pdf.ln(4)
+        pdf.cell(0, 8, "Resultados dos módulos elásticos:", ln=True)
+        for k, v in modulos.items():
+            pdf.cell(0, 8, f"  {k}: {v:.4f}", ln=True)
+        pdf_bytes = pdf.output(dest='S').encode('latin1')
+        st.download_button(
+            label="Baixar Relatório PDF",
+            data=pdf_bytes,
+            file_name="modulos_elasticos.pdf",
+            mime="application/pdf"
+        )
+
+# --- Atualizar menu lateral ---
+st.sidebar.title("Navegação")
+page = st.sidebar.radio("Selecione um Módulo", [
+    "Módulo 1: Christoffel Solver",
+    "Módulo 2: Modelo Ultrassônico",
+    "Módulo 3: Likelihood Bayesiana",
+    "Módulo 4: MCMC Metropolis-Hastings",
+    "Módulo 5: Validação Completa",
+    "Módulo 6: Módulos Elásticos"
+])
